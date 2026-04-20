@@ -50,12 +50,27 @@ async def get_graph_stats(
             edge_record = edge_result.single()
             edge_count = edge_record["count"] if edge_record else 0
 
-            # 获取各类型节点数量
-            type_result = session.run("""
+            # 获取各类型节点数量 (排除 base 标签，显示实际业务类型)
+            # 方式1: 有 entity_type 属性的节点 (LightRAG 创建)
+            # 方式2: 无 entity_type 但有非 base 标签的节点
+            result1 = session.run("""
                 MATCH (n)
-                RETURN labels(n)[0] as type, count(n) as count
+                WHERE n.entity_type IS NOT NULL
+                RETURN n.entity_type as type, count(n) as count
             """)
-            entity_type_counts = {record["type"]: record["count"] for record in type_result}
+            result2 = session.run("""
+                MATCH (n)
+                WHERE n.entity_type IS NULL
+                WITH n, [l IN labels(n) WHERE l <> 'base'][0] as biz_label
+                WHERE biz_label IS NOT NULL
+                RETURN biz_label as type, count(n) as count
+            """)
+            entity_type_counts: Dict[str, int] = {}
+            for record in result1:
+                entity_type_counts[record["type"]] = record["count"]
+            for record in result2:
+                t = record["type"]
+                entity_type_counts[t] = entity_type_counts.get(t, 0) + record["count"]
 
             return GraphStats(
                 node_count=node_count,
@@ -78,27 +93,26 @@ async def list_nodes(
     driver = get_neo4j_driver()
     try:
         with driver.session() as session:
-            # 构建查询
-            query = "MATCH (n)"
-            params = {}
-
-            if entity_type:
-                query = f"MATCH (n:{entity_type})"
+            # 构建查询 - 统一使用 COALESCE 兼容两种节点 schema:
+            #   自定义节点: name 字段存名称
+            #   LightRAG 节点: entity_id 字段存名称
+            match_clause = f"MATCH (n:{entity_type})" if entity_type else "MATCH (n)"
+            where_clause = ""
+            params: Dict[str, Any] = {}
 
             if search:
-                query += " WHERE n.name CONTAINS $search"
+                # 同时搜索 name 和 entity_id
+                where_clause = " WHERE n.name CONTAINS $search OR n.entity_id CONTAINS $search"
                 params["search"] = search
 
             # 获取总数
-            count_query = query.replace("MATCH (n)", "MATCH (n) RETURN count(n) as total")
-            if entity_type:
-                count_query = f"MATCH (n:{entity_type}) RETURN count(n) as total"
+            count_query = match_clause + where_clause + " RETURN count(n) as total"
             count_result = session.run(count_query, params)
             count_record = count_result.single()
             total = count_record["total"] if count_record else 0
 
             # 获取节点
-            query += " RETURN n SKIP $offset LIMIT $limit"
+            query = match_clause + where_clause + " RETURN n SKIP $offset LIMIT $limit"
             params["limit"] = limit
             params["offset"] = offset
 
@@ -108,11 +122,21 @@ async def list_nodes(
                 node = record["n"]
                 labels = list(node.labels)
                 properties = dict(node)
+
+                # 兼容两种 schema: 自定义节点用 name, LightRAG 节点用 entity_id
+                name = properties.get("name") or properties.get("entity_id") or ""
+
+                # 兼容两种 label 结构:
+                #   自定义节点: labels 如 ["纳税人"], 取 labels[0]
+                #   LightRAG 节点: labels 如 ["base", "概念"], 排除 "base" 后取第一个
+                display_labels = [l for l in labels if l != "base"]
+                node_type = properties.get("entity_type") or (display_labels[0] if display_labels else (labels[0] if labels else "Unknown"))
+
                 nodes.append(GraphNode(
-                    id=properties.get("id", str(node.id)),
-                    name=properties.get("name", ""),
-                    entity_type=labels[0] if labels else "Unknown",
-                    attributes={k: v for k, v in properties.items() if k not in ["id", "name", "type"]}
+                    id=properties.get("id", node.element_id),
+                    name=name,
+                    entity_type=node_type,
+                    attributes={k: v for k, v in properties.items() if k not in ["id", "name", "type", "entity_id", "entity_type"]}
                 ))
 
             return GraphNodesResponse(items=nodes, total=total)
@@ -145,8 +169,14 @@ async def list_edges(
             count_record = count_result.single()
             total = count_record["total"] if count_record else 0
 
-            # 获取边
-            query = f"{match_clause} RETURN s.name as source, t.name as target, type(r) as relation SKIP $offset LIMIT $limit"
+            # 获取边 - 兼容两种节点 schema (name vs entity_id)
+            query = (
+                f"{match_clause} "
+                "RETURN COALESCE(s.name, s.entity_id) as source, "
+                "       COALESCE(t.name, t.entity_id) as target, "
+                "       type(r) as relation "
+                "SKIP $offset LIMIT $limit"
+            )
             params = {"limit": limit, "offset": offset}
 
             result = session.run(query, params)
@@ -196,13 +226,14 @@ async def update_node(
     node_data: GraphNodeUpdate,
     current_user = Depends(get_current_user)
 ):
-    """更新节点"""
+    """更新节点 (支持按 id / name / entity_id 查询)"""
     driver = get_neo4j_driver()
     try:
         with driver.session() as session:
             updates = []
-            params = {"node_id": node_id}
+            params: Dict[str, Any] = {}
 
+            # 优先用 name/entity_id 查询 (LightRAG 节点没有 id 属性)
             if node_data.name:
                 updates.append("n.name = $name")
                 params["name"] = node_data.name
@@ -213,7 +244,13 @@ async def update_node(
                     params[key] = value
 
             if updates:
-                query = f"MATCH (n) WHERE n.id = $node_id SET {', '.join(updates)}"
+                # 尝试三种方式匹配: name / entity_id / id 属性
+                params["node_id"] = node_id
+                query = (
+                    "MATCH (n) "
+                    "WHERE n.name = $node_id OR n.entity_id = $node_id OR n.id = $node_id "
+                    f"SET {', '.join(updates)}"
+                )
                 session.run(query, params)
 
             return {"message": "节点更新成功"}
@@ -226,12 +263,17 @@ async def delete_node(
     node_id: str,
     current_user = Depends(get_current_user)
 ):
-    """删除节点及其关联边"""
+    """删除节点及其关联边 (支持按 id / name / entity_id 查询)"""
     driver = get_neo4j_driver()
     try:
         with driver.session() as session:
-            # 先删除关联边
-            session.run("MATCH (n) WHERE n.id = $node_id DETACH DELETE n", node_id=node_id)
+            # 尝试三种方式匹配: name / entity_id / id 属性
+            session.run(
+                "MATCH (n) "
+                "WHERE n.name = $node_id OR n.entity_id = $node_id OR n.id = $node_id "
+                "DETACH DELETE n",
+                node_id=node_id
+            )
             return {"message": "节点删除成功"}
     finally:
         driver.close()

@@ -8,14 +8,15 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "vue": "^3.4.0",
-    "vue-router": "^4.2.0",
-    "pinia": "^2.1.0",
-    "axios": "^1.6.7",
-    "element-plus": "^2.5.0",
+    "@antv/g6": "^4.8.24",
     "@element-plus/icons-vue": "^2.3.0",
+    "axios": "^1.6.7",
+    "dayjs": "^1.11.10",
     "echarts": "^5.5.0",
-    "dayjs": "^1.11.10"
+    "element-plus": "^2.5.0",
+    "pinia": "^2.1.0",
+    "vue": "^3.4.0",
+    "vue-router": "^4.2.0"
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^5.0.0",
